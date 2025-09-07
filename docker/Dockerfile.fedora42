@@ -1,0 +1,153 @@
+# DevOps tools image based on Fedora 42
+FROM fedora:42
+
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive \
+    CLOUDSDK_PYTHON=python3 \
+    PATH="/usr/local/bin:/opt/google-cloud-sdk/bin:${PATH}"
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+# --- Base OS deps ---
+RUN dnf -y update && \
+    dnf -y install \
+      ca-certificates curl wget unzip tar xz gzip jq git which \
+      python3 python3-pip gnupg2 shadow-utils findutils sudo \
+      bash-completion openssl && \
+    dnf clean all && rm -rf /var/cache/dnf
+
+# --- HashiCorp repo (no config-manager) ---
+RUN tee /etc/yum.repos.d/hashicorp.repo >/dev/null <<'EOF' && \
+    dnf -y makecache
+[hashicorp]
+name=HashiCorp Stable - Fedora $releasever - $basearch
+baseurl=https://rpm.releases.hashicorp.com/fedora/$releasever/$basearch/stable
+enabled=1
+gpgcheck=1
+gpgkey=https://rpm.releases.hashicorp.com/gpg
+EOF
+
+# --- Microsoft Azure CLI repo ---
+RUN rpm --import https://packages.microsoft.com/keys/microsoft.asc && \
+    tee /etc/yum.repos.d/azure-cli.repo >/dev/null <<'EOF'
+[azure-cli]
+name=Azure CLI
+baseurl=https://packages.microsoft.com/yumrepos/azure-cli
+enabled=1
+gpgcheck=1
+gpgkey=https://packages.microsoft.com/keys/microsoft.asc
+EOF
+
+# -------- Install package-managed tools first --------
+# (Ansible + Azure CLI; Terraform via repo with binary fallback)
+RUN set -eux; \
+    dnf -y install ansible azure-cli || true; \
+    if dnf -y install terraform; then \
+      echo "Terraform installed via RPM"; \
+    else \
+      echo "Terraform RPM not available — falling back to official binary"; \
+      case "${TARGETARCH}" in \
+        amd64) TARCH=amd64 ;; \
+        arm64) TARCH=arm64 ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}"; exit 1 ;; \
+      esac; \
+      VER="$(curl -fsSL https://checkpoint-api.hashicorp.com/v1/check/terraform | jq -r .current_version)"; \
+      curl -fsSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${VER}/terraform_${VER}_linux_${TARCH}.zip"; \
+      unzip -o /tmp/terraform.zip -d /usr/local/bin; \
+      chmod +x /usr/local/bin/terraform; \
+      rm -f /tmp/terraform.zip; \
+    fi; \
+    dnf clean all && rm -rf /var/cache/dnf
+
+# -------- kubectl (official binary) --------
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) KARCH=amd64 ;; \
+      arm64) KARCH=arm64 ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"; \
+    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/${KARCH}/kubectl"; \
+    chmod +x /usr/local/bin/kubectl; \
+    kubectl version --client --short
+
+# -------- eksctl (GitHub release) --------
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) EARCH=amd64 ;; \
+      arm64) EARCH=arm64 ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_${EARCH}.tar.gz" \
+      | tar -xz -C /usr/local/bin eksctl; \
+    chmod +x /usr/local/bin/eksctl; \
+    eksctl version
+
+# -------- Helm (official script) --------
+RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash && \
+    helm version --short
+
+# -------- AWS CLI v2 --------
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) AWSURL="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" ;; \
+      arm64) AWSURL="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    mkdir -p /tmp/awscli && \
+    curl -fsSL "$AWSURL" -o /tmp/awscli/awscliv2.zip && \
+    unzip -q /tmp/awscli/awscliv2.zip -d /tmp/awscli && \
+    /tmp/awscli/aws/install && \
+    rm -rf /tmp/awscli; \
+    aws --version
+
+# -------- Google Cloud SDK (+ GKE auth plugin) --------
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) GURL="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz" ;; \
+      arm64) GURL="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-arm64.tar.gz" ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    mkdir -p /opt && \
+    curl -fsSL "$GURL" -o /tmp/google-cloud-cli.tar.gz && \
+    tar -xzf /tmp/google-cloud-cli.tar.gz -C /opt && \
+    rm -f /tmp/google-cloud-cli.tar.gz && \
+    /opt/google-cloud-sdk/install.sh --quiet \
+      --usage-reporting=false \
+      --path-update=false \
+      --bash-completion=false \
+      --additional-components gke-gcloud-auth-plugin && \
+    gcloud --version
+
+# -------- Flux CLI (fluxcd) --------
+    # I've had some issue with network slowness/timeouts when using flux install script
+RUN curl -s https://fluxcd.io/install.sh | bash && \
+    flux --version
+
+# -------- completions (optional) --------
+RUN echo 'source /usr/share/bash-completion/bash_completion' >> /etc/bash.bashrc || true && \
+    echo 'source <(kubectl completion bash)' >> /etc/bash.bashrc && \
+    echo 'complete -C /usr/local/bin/terraform terraform' >> /etc/bash.bashrc || true && \
+    echo 'source <(helm completion bash)' >> /etc/bash.bashrc && \
+    echo 'source <(flux completion bash)' >> /etc/bash.bashrc
+
+# Non-root user for convenience
+RUN useradd -ms /bin/bash devops && \
+    echo "devops ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/99-devops && chmod 0440 /etc/sudoers.d/99-devops
+USER devops
+WORKDIR /home/devops
+
+# Basic check (won’t fail build if offline)
+RUN set +e; \
+    kubectl version --client --short || true; \
+    eksctl version || true; \
+    terraform -version | head -n1 || true; \
+    helm version --short || true; \
+    az version 2>/dev/null | head -n1 || true; \
+    gcloud version | head -n1 || true; \
+    aws --version || true; \
+    flux --version || true
+
+CMD ["/bin/bash"]
+
+# devops_tools image based on Fedora 42
